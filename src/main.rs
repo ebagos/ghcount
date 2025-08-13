@@ -90,10 +90,15 @@ async fn main() -> Result<()> {
         let (owner, repo_name) = (parts[0], parts[1]);
 
         println!("Fetching repository: {}", target_repo);
-        if let Ok(repository) = github_client.get_single_repository(owner, repo_name).await {
-            all_repositories.push(repository);
-        } else {
-            println!("Warning: Could not fetch repository: {}", target_repo);
+        match github_client.get_single_repository(owner, repo_name).await {
+            Ok(repository) => {
+                all_repositories.push(repository);
+                println!("✓ Successfully fetched: {}", target_repo);
+            }
+            Err(e) => {
+                println!("✗ Error fetching {}: {}", target_repo, e);
+                continue;
+            }
         }
     }
     println!("Found {} target repositories", all_repositories.len());
@@ -110,7 +115,7 @@ async fn main() -> Result<()> {
             println!("Processing repository: {} ({})", repo.full_name, language);
 
             // Clone and analyze repository
-            let stats = analyze_repository(&repo).await?;
+            let stats = analyze_repository(&repo, &args.token).await?;
 
             // Update repository stats using full_name for uniqueness
             report_data
@@ -176,8 +181,9 @@ impl GitHubClient {
         let response = self
             .client
             .get(&url)
-            .header("Authorization", format!("token {}", self.token))
+            .header("Authorization", format!("Bearer {}", self.token))
             .header("User-Agent", "ghcount")
+            .header("Accept", "application/vnd.github.v3+json")
             .send()
             .await?;
 
@@ -187,12 +193,20 @@ impl GitHubClient {
             repository.full_name = format!("{}/{}", owner, repo);
             Ok(repository)
         } else {
-            anyhow::bail!("Failed to fetch repository: {}/{}", owner, repo);
+            let status = response.status();
+            let error_text = response.text().await.unwrap_or_else(|_| "Unknown error".to_string());
+            
+            match status.as_u16() {
+                401 => anyhow::bail!("認証エラー: GitHubトークンが無効です。適切な権限を持つPersonal Access Tokenを設定してください。"),
+                403 => anyhow::bail!("アクセス拒否: リポジトリ {}/{} にアクセスする権限がありません。プライベートリポジトリの場合は適切な権限が必要です。", owner, repo),
+                404 => anyhow::bail!("リポジトリが見つかりません: {}/{}。リポジトリ名が正しいか、アクセス権限があるか確認してください。", owner, repo),
+                _ => anyhow::bail!("GitHub API エラー ({}): {}", status, error_text),
+            }
         }
     }
 }
 
-async fn analyze_repository(repo: &Repository) -> Result<CodeStats> {
+async fn analyze_repository(repo: &Repository, token: &str) -> Result<CodeStats> {
     use regex::Regex;
     use std::fs;
     use std::process::Command;
@@ -204,13 +218,24 @@ async fn analyze_repository(repo: &Repository) -> Result<CodeStats> {
     // Remove existing directory if it exists
     let _ = fs::remove_dir_all(&temp_dir);
 
-    // Clone the repository
+    // Clone the repository with authentication for private repositories
+    let authenticated_url = if repo.clone_url.starts_with("https://github.com/") {
+        repo.clone_url.replace("https://github.com/", &format!("https://{}@github.com/", token))
+    } else {
+        repo.clone_url.clone()
+    };
+
     let output = Command::new("git")
-        .args(["clone", "--depth", "1", &repo.clone_url, &temp_dir])
+        .args(["clone", "--depth", "1", &authenticated_url, &temp_dir])
         .output()?;
 
     if !output.status.success() {
-        anyhow::bail!("Failed to clone repository: {}", repo.name);
+        let error_output = String::from_utf8_lossy(&output.stderr);
+        if error_output.contains("Authentication failed") || error_output.contains("access denied") {
+            anyhow::bail!("認証エラー: プライベートリポジトリ {} のクローンに失敗しました。GitHubトークンに適切な権限があることを確認してください。", repo.name);
+        } else {
+            anyhow::bail!("リポジトリのクローンに失敗: {} - {}", repo.name, error_output);
+        }
     }
 
     let language = repo.language.as_deref().unwrap_or("Unknown");
