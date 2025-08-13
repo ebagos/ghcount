@@ -1,0 +1,9 @@
+{
+  "teams": [
+    {
+      "name": "Backend Team",
+      "organization": "ebagos",
+      "repositories": ["workdays", "sub-issue-test"]
+    }
+  ]
+}
